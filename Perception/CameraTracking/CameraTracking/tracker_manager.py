@@ -21,7 +21,7 @@ class PerceptionRiskModule:
             conf=conf,
             imgsz=imgsz,
             allowed_classes={
-                "person", "bicycle", "car", "motorcycle", "bus", "truck"
+                "person", "bicycle", "car", "motorcycle", "bus", "truck","traffic light"
             }
         )
 
