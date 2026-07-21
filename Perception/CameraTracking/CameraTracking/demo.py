@@ -1,6 +1,7 @@
 import time
 import cv2
 from CameraTracking.tracker_manager import PerceptionRiskModule
+
 from risk.risk_engine import (
     make_ego_corridor,
     predict_ego_corridor,
@@ -11,7 +12,6 @@ from CameraPerception.traffic_light import (
     select_relevant_traffic_light,
     is_valid_traffic_light,
 )
-
 
 latencies = []
 

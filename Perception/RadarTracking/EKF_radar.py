@@ -2,7 +2,6 @@
 # and our state  estimation is x = [X,Y,Vx,Vy]
 
 import matplotlib.pyplot as plt
-import statistics
 import numpy as np
 import math
 
@@ -148,3 +147,5 @@ class RadEKF:
         self.predict()
         return self.update(measurement)
     
+
+
