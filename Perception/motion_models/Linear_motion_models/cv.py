@@ -53,7 +53,7 @@ class ConstantVelocityModel(LinearMotionModel):
 
         self.acceleration_std = acceleration_std
 
-    def state_transition_matrix(self, dt: float) -> np.ndarray:
+    def transition_matrix(self, dt: float) -> np.ndarray:
         """
         Construct the Constant Velocity transition matrix F.
         """
