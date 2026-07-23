@@ -65,3 +65,9 @@ dist/
 
 *.tmp
 *.swp
+
+# Large generated assets
+*.pt
+*.mp4
+__pycache__/
+*.pyc
