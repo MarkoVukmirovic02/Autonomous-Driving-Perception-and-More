@@ -1,404 +1,295 @@
+"""Conventional linear Kalman filtering with validated Gaussian snapshots.
+
+For the model x_k=F_k*x_(k-1)+w_k, z_k=H_k*x_k+v_k, a Gaussian initial
+belief and mutually independent zero-mean Gaussian disturbances independent
+of that initial state yield exact Gaussian Bayesian filtering. Matrices and
+covariances are treated as known. This implementation has no explicit B*u
+or affine observation offset; those require a deliberate model extension.
+
+With suitable zero cross-covariances and finite second moments, the same
+linear recursions have a linear minimum-mean-square-error interpretation
+without Gaussianity. They then need not equal the unrestricted posterior
+mean, and x/P do not describe the full posterior distribution.
+
+In code, x denotes the estimated mean (m in the thesis), not ground truth.
+P denotes its modeled error covariance. The filter handles numerical inference;
+adapters/trackers handle raw data conversion, time, frame and sensor context.
+"""
 import numpy as np
 
 from Perception.motion_models.linear.linear_base import LinearMotionModel
-from Perception.measurement_models.linear.linear_base import (
-    LinearMeasurementModel,
+from Perception.measurement_models.linear.linear_base import LinearMeasurementModel
+from Perception.tracking.types import (
+    InnovationDiagnostics, Measurement, MeasurementPrediction,
+    validate_gaussian_state, _covariance, _dimension, _real_array, _vector,
 )
 
 
 class KalmanFilter:
+    """Generic linear estimator with Joseph-form covariance updates.
+
+    Constructor arguments are detached; all model outputs are checked at the
+    numerical boundary. x0 must have shape (state_dim,), not a row/column matrix.
+    State and observation dimensions/order must agree with the configured models.
+
+    Public x/P remain writable for compatibility. Prefer replace_state to make
+    deliberate changes because it validates and clears stale diagnostics.
+    Returned states/results are detached from filter storage.
+
+    predict/update compute and validate candidates before committing x/P and
+    diagnostic caches. step additionally restores this filter's state/caches
+    if its combined prediction/update fails. This does not roll back external
+    side effects in custom model implementations or provide thread safety.
+
+    Exact Gaussian claims concern Euclidean linear models. Angular metadata
+    supports local wrapping conventions, not exact global Gaussian inference
+    on a circle or a general nonlinear/periodic observation law.
     """
-    Generic linear Kalman filter.
+    _CACHE_NAMES = ('innovation', 'innovation_covariance', 'kalman_gain',
+                    'predicted_measurement', 'last_innovation')
 
-    The filter requires:
-
-        - a linear motion model:
-
-              x_k = F x_{k-1} + w_k
-
-        - a linear measurement model:
-
-              z_k = H x_k + v_k
-
-    where:
-
-        w_k ~ N(0, Q)
-        v_k ~ N(0, R)
-    """
-
-    def __init__(
-        self,
-        x0: np.ndarray,
-        P0: np.ndarray,
-        motion_model: LinearMotionModel,
-        measurement_model: LinearMeasurementModel,
-    ) -> None:
-        self.x = np.asarray(
-            x0,
-            dtype=float,
-        ).reshape(-1).copy()
-
-        self.P = np.asarray(
-            P0,
-            dtype=float,
-        ).copy()
-
-        if not isinstance(
-            motion_model,
-            LinearMotionModel,
-        ):
-            raise TypeError(
-                "KalmanFilter requires a LinearMotionModel."
-            )
-
-        if not isinstance(
-            measurement_model,
-            LinearMeasurementModel,
-        ):
-            raise TypeError(
-                "KalmanFilter requires a LinearMeasurementModel."
-            )
-
-
-
+    def __init__(self, x0: np.ndarray, P0: np.ndarray,
+                 motion_model: LinearMotionModel,
+                 measurement_model: LinearMeasurementModel) -> None:
+        if not isinstance(motion_model, LinearMotionModel):
+            raise TypeError('KalmanFilter requires a LinearMotionModel.')
+        if not isinstance(measurement_model, LinearMeasurementModel):
+            raise TypeError('KalmanFilter requires a LinearMeasurementModel.')
         self.motion_model = motion_model
         self.measurement_model = measurement_model
-
-        self.state_dim = self.x.size
-        self.I = np.eye(
-            self.state_dim,
-            dtype=float,
-        )
-
-        self.innovation: np.ndarray | None = None
-        self.innovation_covariance: np.ndarray | None = None
-        self.kalman_gain: np.ndarray | None = None
-        self.predicted_measurement: np.ndarray | None = None
-
-        self._validate_initial_state()
+        self.state_dim = _dimension(motion_model.state_dim, 'state_dim')
+        if measurement_model.state_dim != self.state_dim:
+            raise ValueError('Motion and measurement state dimensions must agree.')
+        self.state_angle_indices = tuple(getattr(motion_model, 'angle_indices', ()))
+        self.measurement_angle_indices = tuple(getattr(measurement_model, 'angle_indices', ()))
+        initial = validate_gaussian_state(x0, P0, self.state_dim, self.state_angle_indices)
+        self.x, self.P = initial.x.copy(), initial.P.copy()
+        self.I = np.eye(self.state_dim)
+        self._clear_diagnostics()
+        # Exercise H/R validation before exposing an incorrectly configured filter.
         self._validate_models()
 
-    def _validate_initial_state(self) -> None:
+    def _clear_diagnostics(self):
+        for name in self._CACHE_NAMES:
+            setattr(self, name, None)
+
+    @property
+    def measurement_space_identity(self):
+        """Forward declared observation semantics; legacy unidentified models return None."""
+        if getattr(self.measurement_model, 'measurement_space_identity', None) is None:
+            return None
+        return self.measurement_model.validate_measurement_space_identity()
+
+    def _validate_initial_state(self):
+        """Compatibility helper: validate/install the current numerical state."""
+        state = validate_gaussian_state(self.x, self.P, self.state_dim,
+                                         self.state_angle_indices)
+        self.x, self.P = state.x, state.P
+
+    def _validate_models(self):
+        if (_dimension(self.motion_model.state_dim, 'motion state_dim') != self.state_dim
+                or _dimension(self.measurement_model.state_dim, 'measurement state_dim')
+                != self.state_dim):
+            raise ValueError('Model state dimensions must match the filter.')
+        self._observation_matrix(self.x)
+        self._measurement_noise()
+        # Validate angle metadata even when semantic identity is unspecified.
+        if self.measurement_model._measurement_angles() != self.measurement_angle_indices:
+            raise ValueError('Measurement angular metadata is inconsistent.')
+        if getattr(self.measurement_model, 'measurement_space_identity', None) is not None:
+            self.measurement_space_identity
+
+    def _observation_matrix(self, x):
+        # For this linear contract the Jacobian is exactly H. Obtain one H for
+        # each operation; do not evaluate h independently with a second matrix.
+        H = _real_array(self.measurement_model.jacobian(x), 'H')
+        nz = _dimension(self.measurement_model.measurement_dim, 'measurement_dim')
+        if H.shape != (nz, self.state_dim):
+            raise ValueError(f'H must have shape ({nz}, {self.state_dim}).')
+        return H
+
+    def _measurement_noise(self, R=None):
+        """Use per-observation R when supplied, otherwise the configured model R.
+
+        The override does not reconfigure the model. PSD R is allowed even
+        though innovation diagnostics/update require positive-definite S.
         """
-        Validate x0 and P0.
+        value = self.measurement_model.measurement_noise() if R is None else R
+        nz = _dimension(self.measurement_model.measurement_dim, 'measurement_dim')
+        return _covariance(value, nz, 'R')
+
+    def state_snapshot(self):
+        """Return validated detached native-state mean/covariance."""
+        return validate_gaussian_state(self.x, self.P, self.state_dim,
+                                       self.state_angle_indices)
+
+    def replace_state(self, x, P):
+        """Install a validated belief at the existing time; clear old update caches.
+
+        Useful for IMM interaction. This operation itself has no timestamp;
+        the coordinating tracker owns that metadata.
         """
-        if self.x.size == 0:
-            raise ValueError(
-                "x0 must contain at least one state variable."
-            )
+        state = validate_gaussian_state(x, P, self.state_dim, self.state_angle_indices)
+        self.x, self.P = state.x.copy(), state.P.copy()
+        self._clear_diagnostics()
+        return self.state_snapshot()
 
-        if not np.all(np.isfinite(self.x)):
-            raise ValueError(
-                "x0 contains NaN or infinite values."
-            )
+    def predict(self, dt: float) -> np.ndarray:
+        """Evaluate the linear Chapman--Kolmogorov moment prediction.
 
-        expected_shape = (
-            self.state_dim,
-            self.state_dim,
-        )
+        m_minus = F@m_plus
+        P_minus = F@P_plus@F.T+Q
 
-        if self.P.shape != expected_shape:
-            raise ValueError(
-                f"P0 must have shape {expected_shape}, "
-                f"but received {self.P.shape}."
-            )
-
-        if not np.all(np.isfinite(self.P)):
-            raise ValueError(
-                "P0 contains NaN or infinite values."
-            )
-
-        if not np.allclose(
-            self.P,
-            self.P.T,
-            atol=1e-10,
-        ):
-            raise ValueError(
-                "P0 must be symmetric."
-            )
-
-        eigenvalues = np.linalg.eigvalsh(self.P)
-
-        if np.any(eigenvalues < -1e-10):
-            raise ValueError(
-                "P0 must be positive semidefinite."
-            )
-
-        # Remove insignificant numerical asymmetry.
-        self.P = 0.5 * (
-            self.P + self.P.T
-        )
-
-    def _validate_models(self) -> None:
+        Q is the state disturbance covariance accumulated over this interval.
+        Its time dependence follows the concrete disturbance model, not a
+        universal rule. No observation is incorporated and no noise is sampled.
         """
-        Validate compatibility between the state, motion model,
-        and measurement model.
-        """
-        if self.motion_model.state_dim != self.state_dim:
-            raise ValueError(
-                "Motion-model state dimension does not match x0: "
-                f"{self.motion_model.state_dim} != {self.state_dim}."
-            )
-
-        if self.measurement_model.state_dim != self.state_dim:
-            raise ValueError(
-                "Measurement-model state dimension does not match x0: "
-                f"{self.measurement_model.state_dim} != "
-                f"{self.state_dim}."
-            )
-
-        H = np.asarray(
-            self.measurement_model.measurement_matrix(),
-            dtype=float,
-        )
-
-        R = np.asarray(
-            self.measurement_model.measurement_noise(),
-            dtype=float,
-        )
-
-        expected_H_shape = (
-            self.measurement_model.measurement_dim,
-            self.state_dim,
-        )
-
-        if H.shape != expected_H_shape:
-            raise ValueError(
-                f"H must have shape {expected_H_shape}, "
-                f"but received {H.shape}."
-            )
-
-        expected_R_shape = (
-            self.measurement_model.measurement_dim,
-            self.measurement_model.measurement_dim,
-        )
-
-        if R.shape != expected_R_shape:
-            raise ValueError(
-                f"R must have shape {expected_R_shape}, "
-                f"but received {R.shape}."
-            )
-
-        if not np.all(np.isfinite(H)):
-            raise ValueError(
-                "H contains NaN or infinite values."
-            )
-
-        if not np.all(np.isfinite(R)):
-            raise ValueError(
-                "R contains NaN or infinite values."
-            )
-
-        if not np.allclose(
-            R,
-            R.T,
-            atol=1e-10,
-        ):
-            raise ValueError(
-                "R must be symmetric."
-            )
-
-        eigenvalues = np.linalg.eigvalsh(R)
-
-        if np.any(eigenvalues < -1e-10):
-            raise ValueError(
-                "R must be positive semidefinite."
-            )
-
-    def predict(
-        self,
-        dt: float,
-    ) -> np.ndarray:
-        """
-        Perform the linear Kalman prediction step.
-        """
-        F = np.asarray(
-            self.motion_model.transition_matrix(dt),
-            dtype=float,
-        )
-
-        Q = np.asarray(
-            self.motion_model.process_noise(dt),
-            dtype=float,
-        )
-
-        expected_shape = (
-            self.state_dim,
-            self.state_dim,
-        )
-
-        if F.shape != expected_shape:
-            raise ValueError(
-                f"F must have shape {expected_shape}, "
-                f"but received {F.shape}."
-            )
-
-        if Q.shape != expected_shape:
-            raise ValueError(
-                f"Q must have shape {expected_shape}, "
-                f"but received {Q.shape}."
-            )
-
-        if not np.all(np.isfinite(F)):
-            raise ValueError(
-                "F contains NaN or infinite values."
-            )
-
-        if not np.all(np.isfinite(Q)):
-            raise ValueError(
-                "Q contains NaN or infinite values."
-            )
-
-        if not np.allclose(
-            Q,
-            Q.T,
-            atol=1e-10,
-        ):
-            raise ValueError(
-                "Q must be symmetric."
-            )
-
-        q_eigenvalues = np.linalg.eigvalsh(Q)
-
-        if np.any(q_eigenvalues < -1e-10):
-            raise ValueError(
-                "Q must be positive semidefinite."
-            )
-
-        self.x = F @ self.x
-
-        self.P = (
-            F @ self.P @ F.T
-            + Q
-        )
-
-        self.P = 0.5 * (
-            self.P + self.P.T
-        )
-
-        if not np.all(np.isfinite(self.x)):
-            raise FloatingPointError(
-                "Predicted state contains NaN or infinite values."
-            )
-
-        if not np.all(np.isfinite(self.P)):
-            raise FloatingPointError(
-                "Predicted covariance contains NaN or infinite values."
-            )
-
+        dt = self.motion_model.validate_dt(dt)
+        current = self.state_snapshot()
+        F = _real_array(self.motion_model.transition_matrix(dt), 'F')
+        if F.shape != (self.state_dim, self.state_dim):
+            raise ValueError('F must match the square state dimension.')
+        Q = _covariance(self.motion_model.process_noise(dt), self.state_dim, 'Q')
+        try:
+            with np.errstate(over='raise', invalid='raise'):
+                mean = F @ current.x
+                covariance = F @ current.P @ F.T+Q
+        except FloatingPointError as error:
+            raise FloatingPointError('Kalman prediction exceeds numerical range.') from error
+        candidate = validate_gaussian_state(mean, covariance, self.state_dim,
+                                             self.state_angle_indices)
+        self.x, self.P = candidate.x, candidate.P
+        self._clear_diagnostics()
         return self.x.copy()
 
-    def update(
-        self,
-        z: np.ndarray,
-    ) -> np.ndarray:
+    def measurement_prediction(self, R=None) -> MeasurementPrediction:
+        """Inspect predicted observation moments without changing the belief.
+
+        z_hat=H@m, C=P@H.T, S=H@P@H.T+R.
+        S includes both predicted-state and observation-noise uncertainty.
         """
-        Perform the linear Kalman correction step.
-
-        The supplied z must already be in the measurement model's
-        measurement space.
-
-        For BoundingBoxMeasurementModel:
-
-            z = [cx, cy, width, height]
-
-        rather than:
-
-            [x1, y1, x2, y2]
-        """
-        measurement = (
-            self.measurement_model.validate_measurement(z)
-        )
-
-        H = np.asarray(
-            self.measurement_model.measurement_matrix(),
-            dtype=float,
-        )
-
-        R = np.asarray(
-            self.measurement_model.measurement_noise(),
-            dtype=float,
-        )
-
-        z_pred = (
-            self.measurement_model.predict_measurement(
-                self.x
-            )
-        )
-
-        y = self.measurement_model.residual(
-            measurement,
-            z_pred,
-        )
-
-        S = H @ self.P @ H.T + R
-        S = 0.5 * (S + S.T)
-
-        if not np.all(np.isfinite(S)):
-            raise FloatingPointError(
-                "Innovation covariance contains NaN or infinite values."
-        )
-
-        # K = P H^T S^-1
-        #
-        # This solve avoids explicitly calculating inv(S).
+        current = self.state_snapshot()
+        H = self._observation_matrix(current.x)
+        noise = self._measurement_noise(R)
         try:
-            K = np.linalg.solve(
-                S,
-                H @ self.P,
-            ).T
+            with np.errstate(over='raise', invalid='raise'):
+                mean = self.measurement_model.validate_measurement(H @ current.x)
+                cross = current.P @ H.T
+                S = H @ cross+noise
+        except FloatingPointError as error:
+            raise FloatingPointError('Observation moment prediction exceeds numerical range.') from error
+        return MeasurementPrediction(mean, .5*(S+S.T), cross, noise, H)
+
+    @staticmethod
+    def innovation_diagnostics_from_values(residual, covariance):
+        """Compute NIS and Gaussian predictive log density using Cholesky solves.
+
+        For S=L@L.T, whitened=L^-1@y and NIS=whitened.T@whitened.
+        log p(z|past)=-0.5*(n_z*log(2*pi)+logdet(S)+NIS).
+        The value is a log density, not a posterior mode probability or a
+        direct measure of sensor reliability. Correlated coordinates are allowed.
+        """
+        residual = _vector(residual, 'innovation residual')
+        S = _covariance(covariance, residual.size, 'innovation covariance')
+        try:
+            factor = np.linalg.cholesky(S)
         except np.linalg.LinAlgError as error:
-            raise np.linalg.LinAlgError(
-                "Innovation covariance S is singular or "
-                "numerically unstable."
-            ) from error
+            raise ValueError('Innovation covariance must be positive definite') from error
+        whitened = np.linalg.solve(factor, residual)
+        with np.errstate(over='raise', invalid='raise'):
+            nis = float(whitened @ whitened)
+            logdet = 2*np.log(np.diag(factor)).sum()
+            likelihood = -.5*(residual.size*np.log(2*np.pi)+logdet+nis)
+        return InnovationDiagnostics(residual, S, nis, float(likelihood), whitened)
 
-        self.x = self.x + K @ y
+    def innovation_diagnostics(self, z, R=None) -> InnovationDiagnostics:
+        """Non-mutating compatibility query used by gating and mode comparison."""
+        measurement = self.measurement_model.validate_measurement(z)
+        prediction = self.measurement_prediction(R)
+        residual = self.measurement_model.residual(measurement, prediction.mean)
+        return self.innovation_diagnostics_from_values(residual, prediction.covariance)
 
-        I_KH = self.I - K @ H
+    def update(self, z: np.ndarray, R=None) -> np.ndarray:
+        """Condition on a measurement already in the declared observation space.
 
-        # Joseph covariance update:
-        #
-        # P = (I-KH)P(I-KH)^T + KRK^T
-        #
-        # This is more numerically stable than:
-        #
-        # P = (I-KH)P
-        self.P = (
-            I_KH @ self.P @ I_KH.T
-            + K @ R @ K.T
-        )
+        K=C@S^-1, m_plus=m_minus+K@y.
+        Joseph covariance: P_plus=(I-KH)@P_minus@(I-KH).T+K@R@K.T.
 
-        self.P = 0.5 * (
-            self.P + self.P.T
-        )
-
-
-        if not np.all(np.isfinite(self.x)):
-            raise FloatingPointError(
-                "Updated state contains NaN or infinite values."
-            )
-
-        if not np.all(np.isfinite(self.P)):
-            raise FloatingPointError(
-                "Updated covariance contains NaN or infinite values."
-            )
-
-        self.predicted_measurement = z_pred.copy()
-        self.innovation = y.copy()
+        Solve a linear system rather than explicitly forming S^-1. The
+        Joseph expression helps numerical PSD preservation, but does not fix
+        incorrect physical models, measurement origins or miscalibrated covariances.
+        All validation/diagnostics finish before committing the updated belief.
+        """
+        measurement = self.measurement_model.validate_measurement(z)
+        current = self.state_snapshot()
+        prediction = self.measurement_prediction(R)
+        H, noise, S = prediction.jacobian, prediction.noise, prediction.covariance
+        residual = self.measurement_model.residual(measurement, prediction.mean)
+        diagnostic = self.innovation_diagnostics_from_values(residual, S)
+        # Positive-definiteness has already been checked by the diagnostics.
+        K = np.linalg.solve(S, prediction.cross_covariance.T).T
+        try:
+            with np.errstate(over='raise', invalid='raise'):
+                mean = current.x+K @ residual
+                I_KH = self.I-K @ H
+                covariance = I_KH @ current.P @ I_KH.T+K @ noise @ K.T
+        except FloatingPointError as error:
+            raise FloatingPointError('Kalman update exceeds numerical range.') from error
+        candidate = validate_gaussian_state(mean, covariance, self.state_dim,
+                                             self.state_angle_indices)
+        # Preserve legacy public diagnostics used by existing consumers.
+        self.x, self.P = candidate.x, candidate.P
+        self.predicted_measurement = prediction.mean.copy()
+        self.innovation = residual.copy()
         self.innovation_covariance = S.copy()
         self.kalman_gain = K.copy()
-
+        self.last_innovation = diagnostic
         return self.x.copy()
 
-    def step(
-        self,
-        z: np.ndarray,
-        dt: float,
-    ) -> np.ndarray:
-        """
-        Perform prediction followed by measurement correction.
-        """
-        self.predict(dt)
+    def update_measurement(self, measurement):
+        """Managed update with required semantic identity.
 
-        return self.update(z)
+        Time/frame/source selection remains in adapters/trackers. A numeric
+        filter cannot establish those relationships from values alone.
+        """
+        if not isinstance(measurement, Measurement):
+            raise TypeError('measurement must be a Measurement')
+        identity = measurement.measurement_space_identity
+        if identity is None:
+            raise ValueError('managed measurement must declare a MeasurementSpaceIdentity')
+        if self.measurement_space_identity is None or identity != self.measurement_space_identity:
+            raise ValueError('measurement space does not match estimator')
+        self.measurement_model.validate_measurement(measurement.value)
+        return self.update(measurement.value, R=measurement.covariance)
+
+    def step(self, z: np.ndarray, dt: float, R=None) -> np.ndarray:
+        """Predict then update, restoring this filter's belief/caches on failure.
+
+        Direct predict/update remain separately available. This helper does
+        not schedule timestamps, process missing detections or prevent repeated
+        incorporation of a measurement; those are tracker responsibilities.
+        """
+        measurement = self.measurement_model.validate_measurement(z)
+        dt = self.motion_model.validate_dt(dt)
+        noise = self._measurement_noise(R)
+        before = self.state_snapshot()
+        caches = {name: getattr(self, name) for name in self._CACHE_NAMES}
+        try:
+            self.predict(dt)
+            return self.update(measurement, R=noise)
+        except Exception:
+            self.x, self.P = before.x, before.P
+            for name, value in caches.items():
+                setattr(self, name, value)
+            raise
+
+
+# FUTURE OPERATOR-BASED EXTENSION
+# -------------------------------
+# This filter is an exact linear-Gaussian control case for a learned recursive
+# construction. It does not learn the transition or observation laws.
+# Learned matrices on belief weights/features are not substitutes for the
+# physical F/H matrices or direct equivalents of K. Their full prediction and
+# normalized likelihood reweighting implement analogous Bayesian operations
+# in a different distribution representation. Compare filtering/calibration,
+# conditional-model accuracy and computational approximation separately.
